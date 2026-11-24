@@ -1,0 +1,218 @@
+module g_field_evolution
+
+    use utilities
+    use tov_constants, only: c_light
+    use crust_model
+    use g_profile_module
+    use g_diffusion_solver
+    use t_of_rho, only: temperature_of_rho, T_interior
+    use cooling_curve
+    use conductivity, only: pi
+
+    implicit none
+
+contains
+
+    !--------------------------------------------------------------
+    ! Full pipeline: init crust model + cooling curve, build grid,
+    ! set initial condition, adaptively evolve to log_t_max, write
+    ! results. Replaces the duplicated inline logic previously in
+    ! g_evolve.f90 / g_evolve_sweep.f90.
+    !--------------------------------------------------------------
+    subroutine evolve_g_field(density_profile_file, Ts_ref, M_star_Msun, cooling_file, &
+                               xm_gauss, gwidth, Q_imp, log_t_min, log_t_max, n_output, &
+                               N_grid, output_file, rtol_in)
+
+        implicit none
+
+        character(len=*), intent(in) :: density_profile_file, cooling_file, output_file
+        real(dp), intent(in) :: Ts_ref, M_star_Msun, xm_gauss, gwidth, Q_imp
+        real(dp), intent(in) :: log_t_min, log_t_max
+        integer, intent(in)  :: n_output, N_grid
+        real(dp), intent(in), optional :: rtol_in
+
+        real(dp), allocatable :: x(:), g(:)
+        real(dp) :: x_c, x_s, dx
+        real(dp) :: R_star_cm, g_surface_0
+        real(dp) :: t_yr, dt_yr_guess, rtol
+        integer :: i, n_out, unit_out
+        integer :: n_accepted, n_rejected
+
+        rtol = 1.0e-4_dp
+        if (present(rtol_in)) rtol = rtol_in
+
+        call init_crust_model(density_profile_file, Ts_ref, M_star_Msun)
+        call init_cooling_curve(cooling_file)
+
+        allocate(x(N_grid), g(N_grid))
+
+        x_c = get_x_crust_core()
+        x_s = 1.0_dp
+        dx  = (x_s-x_c)/real(N_grid-1,dp)
+        do i = 1, N_grid
+            x(i) = x_c + real(i-1,dp)*dx
+        end do
+
+        call g_profile(x, g, N_grid, dx, xm_gauss, gwidth, 0.0_dp)
+        call check_finite(g, N_grid, "initial condition")
+        g_surface_0 = g(N_grid)
+
+        R_star_cm = crust_R_star_km * 1.0e5_dp
+
+        open(newunit=unit_out, file=output_file, status="replace", action="write")
+        write(unit_out, '(A)') "# log10(t/yr)   Bs/B0   n_accepted   n_rejected"
+
+        t_yr = 10.0_dp**log_t_min
+        write(unit_out, '(F10.4,3X,F14.10,3X,I0,3X,I0)') log_t_min, 1.0_dp, 0, 0
+
+        dt_yr_guess = 0.01_dp*t_yr
+        n_accepted = 0
+        n_rejected = 0
+
+        do n_out = 1, n_output
+            block
+                real(dp) :: t_target
+                t_target = 10.0_dp**(log_t_min + (log_t_max-log_t_min)*real(n_out,dp)/real(n_output,dp))
+                call advance_to_target(g, x, N_grid, dx, x_s, t_yr, t_target, dt_yr_guess, &
+                                        rtol, R_star_cm, Q_imp, n_accepted, n_rejected)
+                write(unit_out, '(F10.4,3X,F14.10,3X,I0,3X,I0)') &
+                      log10(t_yr), g(N_grid)/g_surface_0, n_accepted, n_rejected
+            end block
+        end do
+
+        close(unit_out)
+
+        print '(A,I0,A,I0,A)', " Adaptive stepping: ", n_accepted, " accepted, ", &
+              n_rejected, " rejected steps."
+
+        deallocate(x, g)
+
+    end subroutine evolve_g_field
+
+
+    !--------------------------------------------------------------
+    ! Advances g from t_yr to t_target via step-doubling: one trial
+    ! step at dt, versus two trial steps at dt/2. Their difference
+    ! estimates local error, which controls accept/reject and the
+    ! next step size. dt_yr (in/out) carries the accepted step size
+    ! forward as a starting guess for the next call.
+    !--------------------------------------------------------------
+    subroutine advance_to_target(g, x, N, dx, x_s, t_yr, t_target, dt_yr, &
+                                  rtol, R_star_cm, Q_imp, n_accepted, n_rejected)
+        implicit none
+        integer, intent(in)     :: N
+        real(dp), intent(inout) :: g(N)
+        real(dp), intent(in)    :: x(N), dx, x_s, t_target, rtol, R_star_cm, Q_imp
+        real(dp), intent(inout) :: t_yr, dt_yr
+        integer, intent(inout)  :: n_accepted, n_rejected
+
+        real(dp) :: g_full(N), g_half(N)
+        real(dp) :: err, dt_try
+        integer :: attempt
+
+        do while (t_yr < t_target)
+
+            dt_try = min(dt_yr, t_target - t_yr)
+            if (dt_try <= 0.0_dp) exit
+
+            do attempt = 1, 50
+
+                g_full = g
+                call take_step(g_full, x, N, dx, x_s, t_yr, dt_try, R_star_cm, Q_imp)
+
+                g_half = g
+                call take_step(g_half, x, N, dx, x_s, t_yr, 0.5_dp*dt_try, R_star_cm, Q_imp)
+                call take_step(g_half, x, N, dx, x_s, t_yr+0.5_dp*dt_try, &
+                               0.5_dp*dt_try, R_star_cm, Q_imp)
+
+                call check_finite(g_full, N, "trial full step")
+                call check_finite(g_half, N, "trial half step")
+
+                err = maxval(abs(g_full - g_half)) / max(1.0e-12_dp, maxval(abs(g_half)))
+
+                if (err < rtol) then
+                    g = g_half
+                    t_yr = t_yr + dt_try
+                    n_accepted = n_accepted + 1
+                    dt_yr = dt_try * min(2.0_dp, max(0.5_dp, 0.9_dp*(rtol/max(err,1.0e-14_dp))**0.5_dp))
+                    dt_yr = min(dt_yr, 0.5_dp*max(t_yr,1.0e-3_dp))
+                    exit
+                else
+                    n_rejected = n_rejected + 1
+                    dt_try = dt_try * max(0.2_dp, 0.9_dp*(rtol/err)**0.5_dp)
+                    dt_yr = dt_try
+                    if (attempt == 50) then
+                        print '(A,ES14.6)', " WARNING: step did not converge at t_yr=", t_yr
+                        g = g_half
+                        t_yr = t_yr + dt_try
+                        n_accepted = n_accepted + 1
+                        exit
+                    end if
+                end if
+
+            end do
+
+        end do
+
+    end subroutine advance_to_target
+
+
+    !--------------------------------------------------------------
+    ! One physical CN step of size dt_yr (years), starting at age
+    ! t_yr_start. Recomputes S(x) at the step's midpoint age.
+    !--------------------------------------------------------------
+    subroutine take_step(g, x, N, dx, x_s, t_yr_start, dt_yr_step, R_star_cm, Q_imp)
+        implicit none
+        integer, intent(in)     :: N
+        real(dp), intent(inout) :: g(N)
+        real(dp), intent(in)    :: x(N), dx, x_s, t_yr_start, dt_yr_step, R_star_cm, Q_imp
+
+        real(dp) :: S(N)
+        real(dp) :: Ts_now, Tb_now, rho_here, T_here, sigma_here, r_here, t_mid_yr, dt_sec
+        integer :: j
+
+        t_mid_yr = t_yr_start + 0.5_dp*dt_yr_step
+        Ts_now = Ts_at_age(max(t_mid_yr, 1.0e-3_dp))
+        Tb_now = T_interior(Ts_now, crust_gs)
+
+        do j = 1, N
+            r_here = x(j)*crust_R_star_km
+            rho_here = get_rho_at_r(r_here)
+            T_here = temperature_of_rho(rho_here, Tb_now, Ts_now, crust_gs)
+            sigma_here = get_sigma_given_T(rho_here, T_here, Q_imp)
+            S(j) = c_light**2 / (4.0_dp*pi*sigma_here*R_star_cm**2)
+        end do
+
+        dt_sec = dt_yr_step * 365.25_dp * 86400.0_dp
+        call gcn_step(g, x, N, dx, x_s, S, dt_sec)
+
+    end subroutine take_step
+
+
+    !--------------------------------------------------------------
+    ! Robustness guard: halts immediately with a clear diagnostic
+    ! (context + grid index) if any NaN or divergent value appears,
+    ! instead of letting it silently propagate.
+    !--------------------------------------------------------------
+    subroutine check_finite(g, N, context)
+        implicit none
+        integer, intent(in) :: N
+        real(dp), intent(in) :: g(N)
+        character(len=*), intent(in) :: context
+        integer :: j
+
+        do j = 1, N
+            if (g(j) /= g(j)) then
+                print '(A,A,A,I0)', " FATAL: NaN detected (", context, "), grid index ", j
+                stop 1
+            end if
+            if (abs(g(j)) > 1.0e30_dp) then
+                print '(A,A,A,I0,A,ES14.6)', " FATAL: divergent value (", context, &
+                      "), grid index ", j, ", value=", g(j)
+                stop 1
+            end if
+        end do
+
+    end subroutine check_finite
+
+end module g_field_evolution
